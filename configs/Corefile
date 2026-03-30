@@ -1,0 +1,23 @@
+vms.test {
+    proxmox {
+        baseurl {$PROXMOX_BASE_URL}
+        token {$PROXMOX_API_TOKEN_ID}
+        secret {$PROXMOX_API_TOKEN_SECRET}
+        refresh 5s
+        insecure
+
+        rule {
+            if incidr(Address.IPAddress, '192.168.0.0/16')
+
+            respond "{{.Vm.VMID}}.by-id.{{.Zone}}"
+            respond "{{.Vm.VMID}}.wow.by-id.{{.Zone}}"
+        }
+
+        rule {
+            if 4 == 4
+
+            respond "{{.Vm.VMID}}.by-id.{{.Zone}}"
+            respond "{{.Vm.VMID}}.mdr.by-id.{{.Zone}}"
+        }
+    }
+}

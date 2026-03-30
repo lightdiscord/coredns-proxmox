@@ -3,6 +3,8 @@ package proxmox
 import (
 	"context"
 	"crypto/tls"
+	"errors"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -34,7 +36,24 @@ func parserule(c *caddy.Controller) (*rule, error) {
 		switch c.Val() {
 		case "if":
 			args := c.RemainingArgs()
-			prog, err := expr.Compile(strings.Join(args, " "), expr.AsBool())
+
+			incidr := expr.Function(
+				"incidr",
+				func(params ...any) (any, error) {
+					ip := net.ParseIP(params[0].(string))
+					if ip == nil {
+						return false, errors.New("first argument is not an IP address")
+					}
+					_, cidr, err := net.ParseCIDR(params[1].(string))
+					if err != nil {
+						return false, err
+					}
+					return cidr.Contains(ip), nil
+				},
+				new(func(string, string) bool),
+			)
+
+			prog, err := expr.Compile(strings.Join(args, " "), expr.AsBool(), expr.Env(todoRenderEnv{}), incidr)
 			if err != nil {
 				return nil, plugin.Error(name, err)
 			}

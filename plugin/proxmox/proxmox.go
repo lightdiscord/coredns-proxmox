@@ -32,9 +32,99 @@ type Proxmox struct {
 	rules    []*rule
 }
 
+type AgentNetworkIPAddress struct {
+	IPAddressType string
+	IPAddress     string
+	Prefix        int
+	MacAddress    string
+}
+
+type AgentNetworkIface struct {
+	Name            string
+	HardwareAddress string
+	IPAddresses     []AgentNetworkIPAddress
+}
+
+type VirtualMachine struct {
+	Name string
+	Node string
+
+	VMID   uint64
+	Status string
+	CPU    float64
+	Uptime uint64
+
+	Mem    uint64
+	MaxMem uint64
+
+	CPUs   int
+	NetIn  uint64
+	Netout uint64
+
+	PID      uint64
+	Disk     uint64
+	MaxDisk  uint64
+	DiskRead uint64
+	Tags     []string
+	Template bool
+}
+
 type todoRenderEnv struct {
-	Vm   *proxmoxClient.VirtualMachine
-	Zone string
+	Zone      string
+	Vm        VirtualMachine
+	Interface AgentNetworkIface
+	Address   AgentNetworkIPAddress
+}
+
+func env(zone string, vm *proxmoxClient.VirtualMachine, iface *proxmoxClient.AgentNetworkIface, addr *proxmoxClient.AgentNetworkIPAddress) todoRenderEnv {
+	var addrs []AgentNetworkIPAddress
+
+	for _, addr := range iface.IPAddresses {
+		addrs = append(addrs, AgentNetworkIPAddress{
+			IPAddressType: addr.IPAddressType,
+			IPAddress:     addr.IPAddress,
+			Prefix:        addr.Prefix,
+			MacAddress:    addr.MacAddress,
+		})
+	}
+
+	return todoRenderEnv{
+		Zone: zone,
+		Vm: VirtualMachine{
+			Name: vm.Name,
+			Node: vm.Node,
+
+			VMID:   uint64(vm.VMID),
+			Status: vm.Status,
+			CPU:    vm.CPU,
+			Uptime: vm.Uptime,
+
+			Mem:    vm.Mem,
+			MaxMem: vm.MaxMem,
+
+			CPUs:   vm.CPUs,
+			NetIn:  vm.NetIn,
+			Netout: vm.Netout,
+
+			PID:      uint64(vm.PID),
+			Disk:     vm.Disk,
+			MaxDisk:  vm.MaxDisk,
+			DiskRead: vm.DiskRead,
+			Tags:     strings.Split(vm.Tags, ";"),
+			Template: bool(vm.Template),
+		},
+		Interface: AgentNetworkIface{
+			Name:            iface.Name,
+			HardwareAddress: iface.HardwareAddress,
+			IPAddresses:     addrs,
+		},
+		Address: AgentNetworkIPAddress{
+			IPAddressType: addr.IPAddressType,
+			IPAddress:     addr.IPAddress,
+			Prefix:        addr.Prefix,
+			MacAddress:    addr.MacAddress,
+		},
+	}
 }
 
 func Name() string { return name }
@@ -159,13 +249,14 @@ func (p *Proxmox) todoUpdateRefresh(ctx context.Context) error {
 			for _, iface := range ifaces {
 				for _, addr := range iface.IPAddresses {
 					//domain := fmt.Sprintf("%d.vms.test", vm.VMID)
+					todorename := env(p.zoneName, vm, iface, addr)
 
 					for _, r := range p.rules {
 						todobool := true
 
 						for _, prog := range r.ifs {
 							// TODO: Add information to program environment
-							out, err := expr.Run(prog, nil)
+							out, err := expr.Run(prog, &todorename)
 							if err != nil {
 								return fmt.Errorf("failed to run prog: %v", err)
 							}
@@ -177,10 +268,6 @@ func (p *Proxmox) todoUpdateRefresh(ctx context.Context) error {
 						}
 
 						if todobool {
-							todorename := todoRenderEnv{
-								Vm:   vm,
-								Zone: p.zoneName,
-							}
 
 							for _, resp := range r.responses {
 
