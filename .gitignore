@@ -20,5 +20,7 @@
 # !Makefile
 !configs/Corefile
 
+!Dockerfile
+
 # ...even if they are in subdirectories
 !*/
