@@ -14,23 +14,19 @@ import (
 	"github.com/coredns/caddy"
 	"github.com/coredns/coredns/core/dnsserver"
 	"github.com/coredns/coredns/plugin"
+	"github.com/coredns/coredns/plugin/file"
 	"github.com/coredns/coredns/plugin/pkg/upstream"
 	"github.com/expr-lang/expr"
-	"github.com/expr-lang/expr/vm"
 	proxmoxClient "github.com/luthermonson/go-proxmox"
+	"github.com/miekg/dns"
 )
 
 func init() {
 	plugin.Register("proxmox", setup)
 }
 
-type rule struct {
-	ifs       []*vm.Program
-	responses []*template.Template
-}
-
-func parserule(c *caddy.Controller) (*rule, error) {
-	r := new(rule)
+func parserule(c *caddy.Controller) (*Rule, error) {
+	r := new(Rule)
 
 	for c.NextBlock() {
 		switch c.Val() {
@@ -53,7 +49,7 @@ func parserule(c *caddy.Controller) (*rule, error) {
 				new(func(string, string) bool),
 			)
 
-			prog, err := expr.Compile(strings.Join(args, " "), expr.AsBool(), expr.Env(todoRenderEnv{}), incidr)
+			prog, err := expr.Compile(strings.Join(args, " "), expr.AsBool(), expr.Env(Environment{}), incidr)
 			if err != nil {
 				return nil, plugin.Error(name, err)
 			}
@@ -83,7 +79,16 @@ func setup(c *caddy.Controller) error {
 	insecure := false
 	var baseurl, token, secret string
 
-	var rules []*rule
+	if !c.NextArg() {
+		return plugin.Error(name, c.ArgErr())
+	}
+
+	zone := c.Val()
+	if dns.IsFqdn(zone) {
+		return plugin.Error(name, c.Errf("invalid zone '%s'", zone))
+	}
+
+	var rules []*Rule
 
 	for c.NextBlock() {
 		switch c.Val() {
@@ -168,6 +173,8 @@ func setup(c *caddy.Controller) error {
 		client:   client,
 		upstream: upstream.New(),
 		rules:    rules,
+		zoneName: zone,
+		zone:     file.NewZone(zone, ""),
 	}
 
 	if err := p.Run(ctx); err != nil {

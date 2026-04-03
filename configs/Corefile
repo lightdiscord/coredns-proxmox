@@ -1,5 +1,5 @@
-vms.test {
-    proxmox {
+dns.test {
+    proxmox vms.dns.test {
         baseurl {$PROXMOX_BASE_URL}
         token {$PROXMOX_API_TOKEN_ID}
         secret {$PROXMOX_API_TOKEN_SECRET}

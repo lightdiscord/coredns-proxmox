@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"text/template"
 	"time"
 
 	"github.com/coredns/coredns/plugin"
@@ -14,6 +15,7 @@ import (
 	"github.com/coredns/coredns/plugin/pkg/upstream"
 	"github.com/coredns/coredns/request"
 	"github.com/expr-lang/expr"
+	"github.com/expr-lang/expr/vm"
 	proxmoxClient "github.com/luthermonson/go-proxmox"
 	"github.com/miekg/dns"
 )
@@ -29,8 +31,10 @@ type Proxmox struct {
 	zoneName string
 	lock     sync.RWMutex
 	zone     *file.Zone
-	rules    []*rule
+	rules    []*Rule
 }
+
+// Rewrite data structures of underlying Proxmox client to avoid exposing internal fields and prevent breaking changes.
 
 type AgentNetworkIPAddress struct {
 	IPAddressType string
@@ -69,14 +73,14 @@ type VirtualMachine struct {
 	Template bool
 }
 
-type todoRenderEnv struct {
+type Environment struct {
 	Zone      string
 	Vm        VirtualMachine
 	Interface AgentNetworkIface
 	Address   AgentNetworkIPAddress
 }
 
-func env(zone string, vm *proxmoxClient.VirtualMachine, iface *proxmoxClient.AgentNetworkIface, addr *proxmoxClient.AgentNetworkIPAddress) todoRenderEnv {
+func NewEnvironment(zone string, vm *proxmoxClient.VirtualMachine, iface *proxmoxClient.AgentNetworkIface, addr *proxmoxClient.AgentNetworkIPAddress) *Environment {
 	var addrs []AgentNetworkIPAddress
 
 	for _, addr := range iface.IPAddresses {
@@ -88,7 +92,7 @@ func env(zone string, vm *proxmoxClient.VirtualMachine, iface *proxmoxClient.Age
 		})
 	}
 
-	return todoRenderEnv{
+	return &Environment{
 		Zone: zone,
 		Vm: VirtualMachine{
 			Name: vm.Name,
@@ -133,7 +137,7 @@ func (p *Proxmox) Name() string { return name }
 
 func (p *Proxmox) Run(ctx context.Context) error {
 	go func() {
-		if err := p.todoUpdateRefresh(ctx); err != nil && ctx.Err() == nil {
+		if err := p.reloadZone(ctx); err != nil && ctx.Err() == nil {
 			log.Errorf("failed to refresh: %v", err)
 		}
 		timer := time.NewTimer(p.refresh)
@@ -145,7 +149,7 @@ func (p *Proxmox) Run(ctx context.Context) error {
 				log.Debugf("breaking out of Proxmox refresh loop: %v", ctx.Err())
 				return
 			case <-timer.C:
-				if err := p.todoUpdateRefresh(ctx); err != nil && ctx.Err() == nil {
+				if err := p.reloadZone(ctx); err != nil && ctx.Err() == nil {
 					log.Errorf("failed to refresh: %v", err)
 				}
 			}
@@ -185,29 +189,59 @@ func (p *Proxmox) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 	return dns.RcodeSuccess, nil
 }
 
-func (p *Proxmox) todoUpdateRefresh(ctx context.Context) error {
+type Rule struct {
+	ifs       []*vm.Program
+	responses []*template.Template
+}
+
+func (r *Rule) MatchEnvironment(env *Environment) (bool, error) {
+	for _, prog := range r.ifs {
+		out, err := expr.Run(prog, env)
+		if err != nil {
+			return false, fmt.Errorf("failed to run prog: %v", err)
+		}
+
+		if out == false {
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
+func createSOARecord(ttl uint32, zone string) *dns.SOA {
+	return &dns.SOA{
+		Hdr:     dns.RR_Header{Name: dns.Fqdn(zone), Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: ttl},
+		Ns:      dns.Fqdn("ns1." + zone),
+		Mbox:    dns.Fqdn("hostmaster." + zone),
+		Serial:  0,
+		Refresh: 3600,
+		Retry:   600,
+		Expire:  86400,
+		Minttl:  30,
+	}
+}
+
+func (p *Proxmox) reloadZone(ctx context.Context) error {
 	// TODO: Unsure if virtual machines can return arbitrary values with Guest Agent. If values for a virtual machine
 	//  are not valid, it should not break the records for other virtual machines.
+
+	ttl := uint32(p.refresh.Seconds())
 
 	nodes, err := p.client.Nodes(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get nodes: %v", err)
 	}
 
-	// TODO: Remove
-	p.zoneName = "vms.test"
 	zone := file.NewZone(p.zoneName, "")
 	zone.Upstream = p.upstream
-	// TODO: Rework SOA
-	rr, err := dns.NewRR("@ IN SOA ns.example. admin.example. (1 60 60 60 60)")
-	if err != nil {
-		return fmt.Errorf("failed to create SOA record: %v", err)
-	}
-	if err := zone.Insert(rr); err != nil {
-		return fmt.Errorf("failed to insert SOA record: %v", err)
-	}
 
-	// TODO: Allow filtering based on node name
+	// SOA record is necessary for the lookup function to work.
+	// TODO: The record may be incorrectly constructed or may need manual configuration in the future.
+	err = zone.Insert(createSOARecord(ttl, p.zoneName))
+	if err != nil {
+		return fmt.Errorf("failed to insert record: %v", err)
+	}
 
 	for _, node := range nodes {
 		// Ignore offline or unreachable nodes
@@ -215,7 +249,6 @@ func (p *Proxmox) todoUpdateRefresh(ctx context.Context) error {
 			continue
 		}
 
-		// TODO: Do not refetch the node
 		node, err := p.client.Node(ctx, node.Node)
 		if err != nil {
 			return fmt.Errorf("failed to get node: %v", err)
@@ -227,8 +260,6 @@ func (p *Proxmox) todoUpdateRefresh(ctx context.Context) error {
 		}
 
 		for _, vm := range vms {
-			// TODO: Allow filtering based on vm id, name or tags
-
 			if vm.Status != "running" {
 				continue
 			}
@@ -248,63 +279,24 @@ func (p *Proxmox) todoUpdateRefresh(ctx context.Context) error {
 
 			for _, iface := range ifaces {
 				for _, addr := range iface.IPAddresses {
-					//domain := fmt.Sprintf("%d.vms.test", vm.VMID)
-					todorename := env(p.zoneName, vm, iface, addr)
+					env := NewEnvironment(p.zoneName, vm, iface, addr)
 
 					for _, r := range p.rules {
-						todobool := true
-
-						for _, prog := range r.ifs {
-							// TODO: Add information to program environment
-							out, err := expr.Run(prog, &todorename)
+						if cond, err := r.MatchEnvironment(env); !cond {
 							if err != nil {
-								return fmt.Errorf("failed to run prog: %v", err)
+								return err
 							}
-
-							if out == false {
-								todobool = false
-								break
-							}
+							continue
 						}
 
-						if todobool {
-
-							for _, resp := range r.responses {
-
-								var b bytes.Buffer
-
-								if err := resp.Execute(&b, &todorename); err != nil {
-									return fmt.Errorf("failed to render response: %v", err)
-								}
-
-								domain := b.String()
-
-								if _, ok := dns.IsDomainName(b.String()); !ok {
-									return fmt.Errorf("invalid domain name: %v", domain)
-								}
-
-								// TODO: Handle duplicate entries to avoid returning the same address multiple times
-
-								if addr.IPAddressType == "ipv4" {
-									rfc1035 := fmt.Sprintf("%v %d IN A %s", domain, int64(p.refresh.Seconds()), addr.IPAddress)
-									rr, err := dns.NewRR(rfc1035)
-									if err != nil {
-										return fmt.Errorf("failed to parse resource record: %v", err)
-									}
-									if err := zone.Insert(rr); err != nil {
-										return fmt.Errorf("failed to insert record: %v", err)
-									}
-								} else if addr.IPAddressType == "ipv6" {
-									rfc1035 := fmt.Sprintf("%v %d IN AAAA %s", domain, int64(p.refresh.Seconds()), addr.IPAddress)
-									rr, err := dns.NewRR(rfc1035)
-									if err != nil {
-										return fmt.Errorf("failed to parse resource record: %v", err)
-									}
-									if err := zone.Insert(rr); err != nil {
-										return fmt.Errorf("failed to insert record: %v", err)
-									}
-								} else {
-									// TODO: Log warning unknown address type. Plugin outlived IPv6 ?
+						for _, tpl := range r.responses {
+							rr, err := renderTemplate(tpl, env, addr, ttl)
+							if err != nil {
+								return err
+							}
+							if rr != nil {
+								if err := zone.Insert(rr); err != nil {
+									return fmt.Errorf("failed to insert record: %v", err)
 								}
 							}
 						}
@@ -319,4 +311,40 @@ func (p *Proxmox) todoUpdateRefresh(ctx context.Context) error {
 	p.lock.Unlock()
 
 	return nil
+}
+
+func renderTemplate(tpl *template.Template, env *Environment, addr *proxmoxClient.AgentNetworkIPAddress, ttl uint32) (dns.RR, error) {
+	var b bytes.Buffer
+
+	if err := tpl.Execute(&b, env); err != nil {
+		return nil, fmt.Errorf("failed to render response: %v", err)
+	}
+
+	domain := b.String()
+
+	if _, ok := dns.IsDomainName(domain); !ok {
+		return nil, fmt.Errorf("invalid domain name: %v", domain)
+	}
+
+	// TODO: Handle duplicate entries to avoid returning the same address multiple times
+
+	var rrt string
+
+	switch addr.IPAddressType {
+	case "ipv4":
+		rrt = "A"
+	case "ipv6":
+		rrt = "AAAA"
+	default:
+		log.Warningf("ignoring invalid resource record type: %v", addr.IPAddressType)
+		return nil, nil
+	}
+
+	rfc1035 := fmt.Sprintf("%v %d IN %s %s", domain, ttl, rrt, addr.IPAddress)
+	rr, err := dns.NewRR(rfc1035)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse resource record: %v", err)
+	}
+
+	return rr, nil
 }
