@@ -3,7 +3,6 @@ package proxmox
 import (
 	"context"
 	"crypto/tls"
-	"errors"
 	"net/http"
 	"net/netip"
 	"strconv"
@@ -28,7 +27,7 @@ func init() {
 func incidr(ip string, cidr string) (bool, error) {
 	ip2, err := netip.ParseAddr(ip)
 	if err != nil {
-		return false, errors.New("first argument is not an IP address")
+		return false, err
 	}
 	cidr2, err := netip.ParsePrefix(cidr)
 	if err != nil {
