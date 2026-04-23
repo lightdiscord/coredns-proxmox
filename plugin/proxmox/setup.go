@@ -4,8 +4,8 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
-	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"text/template"
@@ -25,6 +25,18 @@ func init() {
 	plugin.Register("proxmox", setup)
 }
 
+func incidr(ip string, cidr string) (bool, error) {
+	ip2, err := netip.ParseAddr(ip)
+	if err != nil {
+		return false, errors.New("first argument is not an IP address")
+	}
+	cidr2, err := netip.ParsePrefix(cidr)
+	if err != nil {
+		return false, err
+	}
+	return cidr2.Contains(ip2), nil
+}
+
 func parserule(c *caddy.Controller) (*Rule, error) {
 	r := new(Rule)
 
@@ -36,15 +48,7 @@ func parserule(c *caddy.Controller) (*Rule, error) {
 			incidr := expr.Function(
 				"incidr",
 				func(params ...any) (any, error) {
-					ip := net.ParseIP(params[0].(string))
-					if ip == nil {
-						return false, errors.New("first argument is not an IP address")
-					}
-					_, cidr, err := net.ParseCIDR(params[1].(string))
-					if err != nil {
-						return false, err
-					}
-					return cidr.Contains(ip), nil
+					return incidr(params[0].(string), params[1].(string))
 				},
 				new(func(string, string) bool),
 			)
